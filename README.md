@@ -1,9 +1,9 @@
 **Полный гайд по Spring State Machine для онлайн-магазина (Spring Boot 3 + Java 21 + Lombok)**  
-_Включая сохранение состояния в БД, граф переходов и полные примеры кода_
+_Включая сохранение состояния в БД, Guards и бизнес-логику_
 
 ---
 
-### 1. **Зависимости** (`pom.xml`)
+### **1. Зависимости** (`pom.xml`)
 ```xml
 <dependencies>
     <!-- Spring Boot 3 -->
@@ -11,11 +11,14 @@ _Включая сохранение состояния в БД, граф пер
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
-
-    <!-- State Machine -->
     <dependency>
         <groupId>org.springframework.statemachine</groupId>
         <artifactId>spring-statemachine-starter</artifactId>
+        <version>4.0.0</version>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.statemachine</groupId>
+        <artifactId>spring-statemachine-data-jpa</artifactId>
         <version>4.0.0</version>
     </dependency>
 
@@ -41,42 +44,67 @@ _Включая сохранение состояния в БД, граф пер
 
 ---
 
-### 2. **Состояния и события** (`OrderState.java`)
+### **2. Состояния и события**
 ```java
 public enum OrderState {
-    CREATED,
-    PROCESSING,
-    SHIPPED,
-    DELIVERED // Конечное состояние
+    CREATED, PROCESSING, SHIPPED, DELIVERED
 }
 
 public enum OrderEvent {
-    PROCESS,
-    SHIP,
-    DELIVER,
-    CANCEL
+    PROCESS, SHIP, DELIVER, CANCEL
 }
 ```
 
 ---
 
-### 3. **Граф переходов**
+### **3. Граф переходов**
 ```
-[CREATED]
-  │ PROCESS (если товар в наличии)
-  ▼
-[PROCESSING] ──CANCEL──▶ [CREATED]
-  │ SHIP
-  ▼
-[SHIPPED] ──CANCEL──▶ [CREATED]
-  │ DELIVER
-  ▼
-[DELIVERED]
+[CREATED] → PROCESS (если товары в наличии) → [PROCESSING]  
+[PROCESSING] → SHIP (если оплачено) → [SHIPPED]  
+[SHIPPED] → DELIVER (если адрес валиден) → [DELIVERED]  
+[PROCESSING/SHIPPED] → CANCEL → [CREATED]
 ```
 
 ---
 
-### 4. **Конфигурация State Machine** (`OrderStateMachineConfig.java`)
+### **4. Сущность `Order` с Lombok**  
+```java
+@Entity
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Order {
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private String id;
+
+    @Enumerated(EnumType.STRING)
+    private OrderState state;
+
+    @Lob
+    @Convert(converter = StateMachineContextConverter.class)
+    private StateMachineContext<OrderState, OrderEvent> context;
+
+    private boolean paid;
+    private String shippingAddress;
+
+    @ElementCollection
+    private List<OrderItem> items;
+}
+
+@Embeddable
+@Data
+@Builder
+public class OrderItem {
+    private String productId;
+    private boolean inStock;
+}
+```
+
+---
+
+### **5. Конфигурация State Machine**
 ```java
 @Configuration
 @EnableStateMachine
@@ -84,6 +112,8 @@ public enum OrderEvent {
 public class OrderStateMachineConfig extends StateMachineConfigurerAdapter<OrderState, OrderEvent> {
 
     private final Guard<OrderState, OrderEvent> inventoryGuard;
+    private final Guard<OrderState, OrderEvent> paymentGuard;
+    private final Guard<OrderState, OrderEvent> addressGuard;
 
     @Override
     public void configure(StateMachineStateConfigurer<OrderState, OrderEvent> states) throws Exception {
@@ -97,33 +127,50 @@ public class OrderStateMachineConfig extends StateMachineConfigurerAdapter<Order
     @Override
     public void configure(StateMachineTransitionConfigurer<OrderState, OrderEvent> transitions) throws Exception {
         transitions
-            .withExternal()
-                .source(OrderState.CREATED).target(OrderState.PROCESSING)
-                .event(OrderEvent.PROCESS)
-                .guard(inventoryGuard)
-            .and()
-            .withExternal()
-                .source(OrderState.PROCESSING).target(OrderState.SHIPPED)
-                .event(OrderEvent.SHIP)
-            .and()
-            .withExternal()
-                .source(OrderState.SHIPPED).target(OrderState.DELIVERED)
-                .event(OrderEvent.DELIVER)
-            .and()
-            .withExternal()
-                .source(OrderState.PROCESSING).target(OrderState.CREATED)
+            .withExternal().source(OrderState.CREATED).target(OrderState.PROCESSING)
+                .event(OrderEvent.PROCESS).guard(inventoryGuard)
+            .and().withExternal().source(OrderState.PROCESSING).target(OrderState.SHIPPED)
+                .event(OrderEvent.SHIP).guard(paymentGuard)
+            .and().withExternal().source(OrderState.SHIPPED).target(OrderState.DELIVERED)
+                .event(OrderEvent.DELIVER).guard(addressGuard)
+            .and().withExternal().source(OrderState.PROCESSING).target(OrderState.CREATED)
                 .event(OrderEvent.CANCEL)
-            .and()
-            .withExternal()
-                .source(OrderState.SHIPPED).target(OrderState.CREATED)
+            .and().withExternal().source(OrderState.SHIPPED).target(OrderState.CREATED)
                 .event(OrderEvent.CANCEL);
+    }
+}
+```
+
+---
+
+### **6. Guards (Бизнес-логика)**  
+```java
+@Configuration
+public class GuardsConfig {
+
+    @Bean
+    public Guard<OrderState, OrderEvent> inventoryGuard(OrderRepository repo) {
+        return context -> {
+            String orderId = (String) context.getMessageHeader("orderId");
+            return repo.findById(orderId)
+                .map(order -> order.getItems().stream().allMatch(OrderItem::isInStock))
+                .orElse(false);
+        };
     }
 
     @Bean
-    public Guard<OrderState, OrderEvent> inventoryGuard() {
+    public Guard<OrderState, OrderEvent> paymentGuard(OrderRepository repo) {
         return context -> {
-            // Реальная проверка из базы данных
-            return true; 
+            String orderId = (String) context.getMessageHeader("orderId");
+            return repo.findById(orderId).map(Order::isPaid).orElse(false);
+        };
+    }
+
+    @Bean
+    public Guard<OrderState, OrderEvent> addressGuard() {
+        return context -> {
+            String address = (String) context.getExtendedState().get("shippingAddress");
+            return address != null && !address.trim().isEmpty();
         };
     }
 }
@@ -131,130 +178,35 @@ public class OrderStateMachineConfig extends StateMachineConfigurerAdapter<Order
 
 ---
 
-### 5. **Сущность заказа с Lombok** (`Order.java`)
+### **7. Сервис с транзакциями**  
 ```java
-@Entity
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-@Builder
-public class Order {
-    
-    @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
-    private String id;
-
-    @Enumerated(EnumType.STRING)
-    private OrderState currentState;
-
-    @Lob
-    @Convert(converter = StateMachineContextConverter.class)
-    private StateMachineContext<OrderState, OrderEvent> context;
-}
-```
-
----
-
-### 6. **Конвертер состояния** (`StateMachineContextConverter.java`)
-```java
-@Converter
-@RequiredArgsConstructor
-public class StateMachineContextConverter implements 
-    AttributeConverter<StateMachineContext<OrderState, OrderEvent>, byte[]> {
-
-    private final ObjectMapper mapper;
-
-    public StateMachineContextConverter() {
-        this.mapper = new ObjectMapper();
-        this.mapper.registerModule(new Jackson2StateMachineModule());
-    }
-
-    @Override
-    public byte[] convertToDatabaseColumn(StateMachineContext<OrderState, OrderEvent> context) {
-        try {
-            return mapper.writeValueAsBytes(context);
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException("Serialization error", e);
-        }
-    }
-
-    @Override
-    public StateMachineContext<OrderState, OrderEvent> convertToEntityAttribute(byte[] bytes) {
-        if (bytes == null) return null;
-        try {
-            return mapper.readValue(bytes, new TypeReference<>() {});
-        } catch (IOException e) {
-            throw new RuntimeException("Deserialization error", e);
-        }
-    }
-}
-```
-
----
-
-### 7. **Репозиторий и сервис** (`OrderService.java`)
-```java
-public interface OrderRepository extends JpaRepository<Order, String> {}
-
 @Service
 @Transactional
 @RequiredArgsConstructor
 public class OrderService {
-    
     private final OrderRepository orderRepo;
     private final StateMachine<OrderState, OrderEvent> stateMachine;
     private final StateMachinePersister<OrderState, OrderEvent, String> persister;
 
-    public Order createOrder() {
+    public Order createOrder(List<OrderItem> items) {
         return orderRepo.save(Order.builder()
-            .currentState(OrderState.CREATED)
+            .state(OrderState.CREATED)
+            .items(items)
             .build());
     }
 
     public void processOrder(String orderId) throws Exception {
-        Order order = orderRepo.findById(orderId)
-            .orElseThrow(() -> new EntityNotFoundException("Order not found"));
-        
-        // Восстановление состояния
         persister.restore(stateMachine, orderId);
-        
-        // Отправка события
-        if (stateMachine.sendEvent(OrderEvent.PROCESS)) {
-            // Сохранение нового состояния
-            order.setContext(stateMachine.getStateMachineContext());
-            order.setCurrentState(stateMachine.getState().getId());
-            orderRepo.save(order);
-        }
+        stateMachine.sendEvent(MessageBuilder.withPayload(OrderEvent.PROCESS)
+            .setHeader("orderId", orderId)
+            .build());
+        persister.persist(stateMachine.getStateMachineContext(), orderId);
     }
-}
-```
 
----
-
-### 8. **Конфигурация персистентности** (`PersistenceConfig.java`)
-```java
-@Configuration
-@RequiredArgsConstructor
-public class PersistenceConfig {
-
-    private final OrderRepository orderRepo;
-
-    @Bean
-    public StateMachinePersister<OrderState, OrderEvent, String> persister() {
-        return new DefaultStateMachinePersister<>(new StateMachinePersist<>() {
-            @Override
-            public void write(StateMachineContext<OrderState, OrderEvent> context, String orderId) {
-                Order order = orderRepo.findById(orderId).orElseThrow();
-                order.setContext(context);
-                orderRepo.save(order);
-            }
-
-            @Override
-            public StateMachineContext<OrderState, OrderEvent> read(String orderId) {
-                return orderRepo.findById(orderId)
-                    .map(Order::getContext)
-                    .orElse(null);
-            }
+    public void confirmPayment(String orderId) {
+        orderRepo.findById(orderId).ifPresent(order -> {
+            order.setPaid(true);
+            orderRepo.save(order);
         });
     }
 }
@@ -262,43 +214,51 @@ public class PersistenceConfig {
 
 ---
 
-### 9. **Главный класс приложения** (`Application.java`)
+### **8. Персистентность**  
 ```java
-@SpringBootApplication
-public class Application {
-    public static void main(String[] args) {
-        SpringApplication.run(Application.class, args);
+@Converter
+public class StateMachineContextConverter implements 
+    AttributeConverter<StateMachineContext<OrderState, OrderEvent>, byte[]> {
+
+    private static final ObjectMapper mapper = new ObjectMapper()
+        .registerModule(new Jackson2StateMachineModule());
+
+    @Override
+    public byte[] convertToDatabaseColumn(StateMachineContext<OrderState, OrderEvent> context) {
+        try {
+            return mapper.writeValueAsBytes(context);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Ошибка сериализации", e);
+        }
+    }
+
+    @Override
+    public StateMachineContext<OrderState, OrderEvent> convertToEntityAttribute(byte[] bytes) {
+        try {
+            return bytes != null ? mapper.readValue(bytes, new TypeReference<>() {}) : null;
+        } catch (IOException e) {
+            throw new RuntimeException("Ошибка десериализации", e);
+        }
     }
 }
 ```
 
 ---
 
-### 10. **Как запустить**
-1. Создать заказ:  
-   ```bash
-   curl -X POST http://localhost:8080/orders
-   ```
-2. Обработать заказ:  
-   ```bash
-   curl -X POST http://localhost:8080/orders/{id}/process
-   ```
+### **9. Как это работает**  
+1. **Создание заказа**:  
+   - `POST /orders` → сохраняет заказ в статусе `CREATED`.
+2. **Обработка**:  
+   - `POST /orders/{id}/process` → проверяет наличие товара (Guard), переводит в `PROCESSING`.
+3. **Отправка**:  
+   - `POST /orders/{id}/ship` → проверяет оплату (Guard), переводит в `SHIPPED`.
+4. **Доставка**:  
+   - `POST /orders/{id}/deliver` → проверяет адрес (Guard), переводит в `DELIVERED`.
 
 ---
 
-### 11. **Особенности реализации**
-1. **Lombok**:  
-   - `@Data`, `@Builder` и `@RequiredArgsConstructor` генерируют геттеры/сеттеры и конструкторы.
-   
-2. **Java 21**:  
-   - Использованы `Records` (если нужно) и улучшенная работа с сериализацией.
-
-3. **Персистентность**:  
-   - Состояние сохраняется в H2 (для тестов) или любую другую SQL БД.
-
-4. **Безопасность**:  
-   Все операции с State Machine выполняются в транзакциях (`@Transactional`).
-
----
-
-**Итог**: Полная реализация State Machine для онлайн-магазина с автоматическим сохранением состояния в БД и минимальным boilerplate-кодом благодаря Lombok.
+**Итог**:  
+- Guards реализуют ключевые бизнес-правила.  
+- Состояние автоматически сохраняется в БД через JPA.  
+- Lombok уменьшает объем шаблонного кода.  
+- Полный цикл работы онлайн-магазина: от создания заказа до доставки.
